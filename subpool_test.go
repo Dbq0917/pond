@@ -519,3 +519,298 @@ func TestSubpoolRecoversAfterGoexit(t *testing.T) {
 		})
 	}
 }
+
+func waitSubpoolTask(t *testing.T, task Task) error {
+	t.Helper()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- task.Wait()
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for subpool task")
+		return nil
+	}
+}
+
+func TestSubpoolParentFullNonBlocking(t *testing.T) {
+	parent := NewPool(1, WithQueueSize(0), WithNonBlocking(true))
+	subpool := parent.NewSubpool(1)
+
+	releaseParent := make(chan struct{})
+	defer func() {
+		close(releaseParent)
+		subpool.StopAndWait()
+		parent.StopAndWait()
+	}()
+
+	parentStarted := make(chan struct{})
+	parent.Submit(func() {
+		close(parentStarted)
+		<-releaseParent
+	})
+	<-parentStarted
+
+	err := waitSubpoolTask(t, subpool.Submit(func() {}))
+
+	assert.Equal(t, ErrQueueFull, err)
+	assert.Equal(t, int64(0), subpool.RunningWorkers())
+	assert.Equal(t, uint64(0), subpool.WaitingTasks())
+	assert.Equal(t, uint64(1), subpool.DroppedTasks())
+}
+
+func TestSubpoolParentFullBlocking(t *testing.T) {
+	parent := NewPool(1, WithQueueSize(0))
+	subpool := parent.NewSubpool(1)
+
+	releaseParent := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			close(releaseParent)
+		})
+	}
+	defer func() {
+		release()
+		subpool.StopAndWait()
+		parent.StopAndWait()
+	}()
+
+	parentStarted := make(chan struct{})
+	parent.Submit(func() {
+		close(parentStarted)
+		<-releaseParent
+	})
+	<-parentStarted
+
+	taskRan := make(chan struct{})
+	submitDone := make(chan error, 1)
+	go func() {
+		submitDone <- subpool.Submit(func() {
+			close(taskRan)
+		}).Wait()
+	}()
+
+	select {
+	case err := <-submitDone:
+		t.Fatalf("subpool submission returned while the parent was full: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	release()
+
+	select {
+	case err := <-submitDone:
+		assert.Equal(t, nil, err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for subpool submission")
+	}
+
+	select {
+	case <-taskRan:
+	case <-time.After(time.Second):
+		t.Fatal("subpool task did not run after the parent was released")
+	}
+
+	assert.Equal(t, int64(0), subpool.RunningWorkers())
+}
+
+func TestSubpoolParentStopping(t *testing.T) {
+	parent := NewPool(2)
+	subpool := parent.NewSubpool(1)
+
+	blockerStarted := make(chan struct{})
+	releaseBlocker := make(chan struct{})
+	parent.Submit(func() {
+		close(blockerStarted)
+		<-releaseBlocker
+	})
+	<-blockerStarted
+
+	stopDone := make(chan struct{})
+	go func() {
+		parent.StopAndWait()
+		close(stopDone)
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for !parent.Stopped() {
+		if time.Now().After(deadline) {
+			t.Fatal("parent pool did not start stopping")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	defer func() {
+		close(releaseBlocker)
+		<-stopDone
+	}()
+
+	err := waitSubpoolTask(t, subpool.Submit(func() {}))
+
+	assert.Equal(t, ErrPoolStopped, err)
+	assert.Equal(t, int64(0), subpool.RunningWorkers())
+	assert.Equal(t, uint64(0), subpool.WaitingTasks())
+}
+
+func TestSubpoolChainedParentFull(t *testing.T) {
+	parent := NewPool(2, WithQueueSize(0), WithNonBlocking(true))
+	subpool := parent.NewSubpool(1)
+
+	releaseFirstCh := make(chan struct{})
+	var releaseFirstOnce sync.Once
+	releaseFirst := func() {
+		releaseFirstOnce.Do(func() {
+			close(releaseFirstCh)
+		})
+	}
+	releaseParentBlocker := make(chan struct{})
+	defer func() {
+		releaseFirst()
+		close(releaseParentBlocker)
+		subpool.StopAndWait()
+		parent.StopAndWait()
+	}()
+
+	firstStarted := make(chan struct{})
+	first := subpool.Submit(func() {
+		close(firstStarted)
+		<-releaseFirstCh
+	})
+	<-firstStarted
+
+	second := subpool.Submit(func() {})
+
+	parentBlockerStarted := make(chan struct{})
+	parent.Submit(func() {
+		close(parentBlockerStarted)
+		<-releaseParentBlocker
+	})
+	<-parentBlockerStarted
+
+	releaseFirst()
+
+	assert.Equal(t, nil, waitSubpoolTask(t, first))
+	assert.Equal(t, ErrQueueFull, waitSubpoolTask(t, second))
+
+	assert.Equal(t, int64(0), subpool.RunningWorkers())
+	assert.Equal(t, uint64(0), subpool.WaitingTasks())
+}
+
+func TestSubpoolParentFullDrainsQueuedTasks(t *testing.T) {
+	parent := NewPool(2, WithQueueSize(0), WithNonBlocking(true))
+	subpool := parent.NewSubpool(1)
+
+	releaseFirstCh := make(chan struct{})
+	var releaseFirstOnce sync.Once
+	releaseFirst := func() {
+		releaseFirstOnce.Do(func() {
+			close(releaseFirstCh)
+		})
+	}
+	releaseParentBlocker := make(chan struct{})
+	defer func() {
+		releaseFirst()
+		close(releaseParentBlocker)
+		subpool.StopAndWait()
+		parent.StopAndWait()
+	}()
+
+	firstStarted := make(chan struct{})
+	first := subpool.Submit(func() {
+		close(firstStarted)
+		<-releaseFirstCh
+	})
+	<-firstStarted
+
+	queued := make([]Task, 4)
+	for i := range queued {
+		queued[i] = subpool.Submit(func() {})
+	}
+
+	parentBlockerStarted := make(chan struct{})
+	parent.Submit(func() {
+		close(parentBlockerStarted)
+		<-releaseParentBlocker
+	})
+	<-parentBlockerStarted
+
+	releaseFirst()
+
+	assert.Equal(t, nil, waitSubpoolTask(t, first))
+	for _, task := range queued {
+		assert.Equal(t, ErrQueueFull, waitSubpoolTask(t, task))
+	}
+
+	assert.Equal(t, int64(0), subpool.RunningWorkers())
+	assert.Equal(t, uint64(0), subpool.WaitingTasks())
+	assert.Equal(t, uint64(len(queued)), subpool.DroppedTasks())
+}
+
+func TestSubpoolLayeredParentFull(t *testing.T) {
+	parent := NewPool(1, WithQueueSize(0), WithNonBlocking(true))
+	subpool := parent.NewSubpool(1)
+	subsubpool := subpool.NewSubpool(1)
+
+	releaseParent := make(chan struct{})
+	defer func() {
+		close(releaseParent)
+		subsubpool.StopAndWait()
+		subpool.StopAndWait()
+		parent.StopAndWait()
+	}()
+
+	parentStarted := make(chan struct{})
+	parent.Submit(func() {
+		close(parentStarted)
+		<-releaseParent
+	})
+	<-parentStarted
+
+	err := waitSubpoolTask(t, subsubpool.Submit(func() {}))
+
+	assert.Equal(t, ErrQueueFull, err)
+	assert.Equal(t, int64(0), subsubpool.RunningWorkers())
+	assert.Equal(t, int64(0), subpool.RunningWorkers())
+}
+
+func TestSubpoolTrySubmitParentFull(t *testing.T) {
+	parent := NewPool(1, WithQueueSize(0))
+	subpool := parent.NewSubpool(1)
+
+	releaseParent := make(chan struct{})
+	defer func() {
+		close(releaseParent)
+		subpool.StopAndWait()
+		parent.StopAndWait()
+	}()
+
+	parentStarted := make(chan struct{})
+	parent.Submit(func() {
+		close(parentStarted)
+		<-releaseParent
+	})
+	<-parentStarted
+
+	type submitResult struct {
+		task Task
+		ok   bool
+	}
+	submitDone := make(chan submitResult, 1)
+	go func() {
+		task, ok := subpool.TrySubmit(func() {})
+		submitDone <- submitResult{task: task, ok: ok}
+	}()
+
+	select {
+	case result := <-submitDone:
+		assert.True(t, !result.ok)
+		assert.Equal(t, ErrQueueFull, waitSubpoolTask(t, result.task))
+	case <-time.After(time.Second):
+		t.Fatal("TrySubmit blocked while the parent pool was full")
+	}
+}

@@ -148,7 +148,7 @@ type pool struct {
 	workerWaitGroup     sync.WaitGroup
 	submitWaiters       chan struct{}
 	queueSize           int
-	tasks               *linkedbuffer.LinkedBuffer[any]
+	tasks               *linkedbuffer.LinkedBuffer[*poolTask]
 	submittedTaskCount  atomic.Uint64
 	successfulTaskCount atomic.Uint64
 	failedTaskCount     atomic.Uint64
@@ -156,12 +156,44 @@ type pool struct {
 	canceledTaskCount   atomic.Uint64
 }
 
+// poolTask is the unit stored in a pool's queue. The onReject callback is invoked
+// if the task is accepted but can never be executed (e.g. a subpool task that the
+// parent pool refuses to run). It is nil for tasks that do not need to be notified.
+type poolTask struct {
+	task        any
+	nonBlocking bool
+	onReject    func(error)
+}
+
+func (t *poolTask) invoke(panicRecovery bool) (output any, err error) {
+	if t == nil || t.task == nil {
+		return nil, nil
+	}
+
+	return invokeTask[any](t.task, panicRecovery)
+}
+
+func (t *poolTask) reject(err error) {
+	if t != nil && t.onReject != nil {
+		t.onReject(err)
+	}
+}
+
 func (p *pool) Context() context.Context {
 	return p.ctx
 }
 
 func (p *pool) Stopped() bool {
-	return p.closed.Load() || p.ctx.Err() != nil
+	if p.closed.Load() || p.ctx.Err() != nil {
+		return true
+	}
+
+	// A subpool cannot accept tasks once its parent has stopped accepting them.
+	if p.parent != nil {
+		return p.parent.Stopped()
+	}
+
+	return false
 }
 
 func (p *pool) MaxConcurrency() int {
@@ -199,7 +231,11 @@ func (p *pool) Resize(maxConcurrency int) {
 
 	// Launch the new workers
 	for i := 0; i < newWorkers; i++ {
-		p.launchWorker(nil)
+		if err := p.launchWorker(nil); err != nil {
+			p.releaseWorkerSlot()
+			p.recordRejectedTask(err, true)
+			p.drainQueuedTasks(err)
+		}
 	}
 }
 
@@ -246,7 +282,7 @@ func (p *pool) CanceledTasks() uint64 {
 	return p.canceledTaskCount.Load()
 }
 
-func (p *pool) worker(task any) {
+func (p *pool) worker(task *poolTask) {
 	var readTaskErr, err error
 	exitedNormally := false
 	defer func() {
@@ -268,7 +304,7 @@ func (p *pool) worker(task any) {
 	}()
 	for {
 		if task != nil {
-			_, err = invokeTask[any](task, p.panicRecovery)
+			_, err = task.invoke(p.panicRecovery)
 
 			p.updateMetrics(err)
 		}
@@ -282,20 +318,22 @@ func (p *pool) worker(task any) {
 	}
 }
 
-func (p *pool) subpoolWorker(task any) func() (output any, err error) {
+func (p *pool) subpoolWorker(entry *poolTask) func() (output any, err error) {
 	return func() (output any, err error) {
 		exitedNormally := false
 		defer func() {
 			if !exitedNormally {
 				p.updateMetrics(fmt.Errorf("worker exited abnormally: %w", err))
 				if nextTask, readErr := p.readTask(); readErr == nil {
-					p.launchWorker(nextTask)
+					if launchErr := p.launchWorker(nextTask); launchErr != nil {
+						p.handleForwardFailure(nextTask, launchErr)
+					}
 				}
 			}
 		}()
 
-		if task != nil {
-			output, err = invokeTask[any](task, p.panicRecovery)
+		if entry != nil && entry.task != nil {
+			output, err = entry.invoke(p.panicRecovery)
 
 			p.updateMetrics(err)
 		}
@@ -303,26 +341,9 @@ func (p *pool) subpoolWorker(task any) func() (output any, err error) {
 		exitedNormally = true
 
 		// Attempt to submit the next task to the parent pool
-		if task, err := p.readTask(); err == nil {
-			for {
-				submitErr := p.parent.submit(p.subpoolWorker(task), p.nonBlocking)
-				if submitErr == nil {
-					break
-				}
-
-				// Wrap the error with the context canceled error to reflect that the task was canceled.
-				if errors.Is(submitErr, ErrPoolStopped) {
-					err = errors.Join(ErrContextCanceled, submitErr)
-					p.updateMetrics(err)
-					p.parent.updateMetrics(err)
-				}
-
-				// If the parent pool is stopped/canceled it won't accept submissions.
-				// Keep draining the subpool queue so workers can exit cleanly.
-				task, err = p.readTask()
-				if err != nil {
-					break
-				}
+		if nextTask, readErr := p.readTask(); readErr == nil {
+			if launchErr := p.launchWorker(nextTask); launchErr != nil {
+				p.handleForwardFailure(nextTask, launchErr)
 			}
 		}
 
@@ -332,7 +353,7 @@ func (p *pool) subpoolWorker(task any) func() (output any, err error) {
 
 func (p *pool) Go(task func()) error {
 	// Wrap the task so it is skipped if the pool context is canceled while it is queued
-	return p.submit(wrapTask[struct{}, func(error)](task, func(error) {}, p.ctx, p.panicRecovery), p.nonBlocking)
+	return p.submit(wrapTask[struct{}, func(error)](task, func(error) {}, p.ctx, p.panicRecovery), p.nonBlocking, nil)
 }
 
 func (p *pool) Submit(task func()) Task {
@@ -360,7 +381,7 @@ func (p *pool) wrapAndSubmit(task any, nonBlocking bool) (Task, bool) {
 
 	future, wrappedTask, resolve := p.wrapTask(task)
 
-	if err := p.submit(wrappedTask, nonBlocking); err != nil {
+	if err := p.submit(wrappedTask, nonBlocking, resolve); err != nil {
 		resolve(err)
 		return future, false
 	}
@@ -377,14 +398,19 @@ func (p *pool) wrapTask(task any) (Task, func() error, func(error)) {
 	return future, wrappedTask, resolve
 }
 
-func (p *pool) submit(task any, nonBlocking bool) (err error) {
+func (p *pool) submit(task any, nonBlocking bool, onReject func(error)) (err error) {
 
 	p.submittedTaskCount.Add(1)
+	entry := &poolTask{
+		task:        task,
+		nonBlocking: nonBlocking,
+		onReject:    onReject,
+	}
 
 	if nonBlocking {
-		err = p.trySubmit(task)
+		err = p.trySubmit(entry)
 	} else {
-		err = p.blockingTrySubmit(task)
+		err = p.blockingTrySubmit(entry)
 	}
 
 	if err != nil {
@@ -394,9 +420,9 @@ func (p *pool) submit(task any, nonBlocking bool) (err error) {
 	return
 }
 
-func (p *pool) blockingTrySubmit(task any) error {
+func (p *pool) blockingTrySubmit(entry *poolTask) error {
 	for {
-		if err := p.trySubmit(task); err != ErrQueueFull {
+		if err := p.trySubmit(entry); err != ErrQueueFull {
 			return err
 		}
 
@@ -414,7 +440,7 @@ func (p *pool) blockingTrySubmit(task any) error {
 	}
 }
 
-func (p *pool) trySubmit(task any) error {
+func (p *pool) trySubmit(entry *poolTask) error {
 	p.mutex.Lock()
 
 	// Check if the pool has been stopped while holding the lock
@@ -441,7 +467,7 @@ func (p *pool) trySubmit(task any) error {
 		}
 
 		// If queue is enabled, push the task at the back of the queue
-		p.tasks.Write(task)
+		p.tasks.Write(entry)
 		p.mutex.Unlock()
 		return nil
 	}
@@ -449,17 +475,32 @@ func (p *pool) trySubmit(task any) error {
 	p.workerCount.Add(1)
 	p.workerWaitGroup.Add(1)
 
+	launchedTask := entry
 	if queueEnabled && tasksLen > 0 {
 		// Push the task at the back of the queue
-		p.tasks.Write(task)
+		p.tasks.Write(entry)
 
 		// Pop the front task
-		task, _ = p.tasks.Read()
+		launchedTask, _ = p.tasks.Read()
 	}
 
 	p.mutex.Unlock()
 
-	p.launchWorker(task)
+	if err := p.launchWorker(launchedTask); err != nil {
+		p.releaseWorkerSlot()
+
+		if launchedTask == entry {
+			return err
+		}
+
+		// The submitted entry is still queued, but the worker that was going to
+		// process an older task could not be started. Fail the older task and
+		// drain the queue so accepted tasks cannot get stranded without a worker.
+		p.recordRejectedTask(err, true)
+		p.drainQueuedTasks(err)
+		launchedTask.reject(err)
+		return nil
+	}
 
 	// Notify a submit waiter there is room in the queue for a new task
 	p.notifySubmitWaiter()
@@ -467,18 +508,23 @@ func (p *pool) trySubmit(task any) error {
 	return nil
 }
 
-func (p *pool) launchWorker(task any) {
+func (p *pool) launchWorker(entry *poolTask) error {
 	if p.parent == nil {
 		// Launch a new worker to execute the task
-		go p.worker(task)
-	} else {
-		// Submit task to the parent pool wrapped in a function that will
-		// submit the next task to the parent pool when it completes (subpool worker)
-		p.parent.submit(p.subpoolWorker(task), p.nonBlocking)
+		go p.worker(entry)
+		return nil
 	}
+
+	// Submit task to the parent pool wrapped in a function that will
+	// submit the next task to the parent pool when it completes (subpool worker)
+	nonBlocking := p.nonBlocking
+	if entry != nil {
+		nonBlocking = entry.nonBlocking
+	}
+	return p.parent.submit(p.subpoolWorker(entry), nonBlocking, p.forwardReject(entry))
 }
 
-func (p *pool) readTask() (task any, err error) {
+func (p *pool) readTask() (task *poolTask, err error) {
 	p.mutex.Lock()
 
 	if p.tasks.Len() == 0 {
@@ -512,6 +558,84 @@ func (p *pool) readTask() (task any, err error) {
 	p.notifySubmitWaiter()
 
 	return
+}
+
+func (p *pool) releaseWorkerSlot() {
+	p.workerCount.Add(-1)
+	p.workerWaitGroup.Done()
+
+	// Notify a submit waiter there is room for a new task
+	p.notifySubmitWaiter()
+}
+
+func (p *pool) forwardReject(entry *poolTask) func(error) {
+	return func(err error) {
+		// The task was accepted by the parent pool but will never be executed,
+		// so release the subpool worker that was reserved for it.
+		p.releaseWorkerSlot()
+		p.recordRejectedTask(err, false)
+		p.drainQueuedTasks(err)
+		entry.reject(err)
+	}
+}
+
+func (p *pool) handleForwardFailure(entry *poolTask, err error) {
+	// This is the error returned by the parent pool while forwarding a task.
+	// The current subpool worker will not be able to continue the chain, so
+	// release its slot and notify the caller about the failed task.
+	p.releaseWorkerSlot()
+	p.recordRejectedTask(err, true)
+	p.drainQueuedTasks(err)
+	entry.reject(err)
+}
+
+func (p *pool) recordRejectedTask(err error, parentAttempted bool) {
+	switch {
+	case errors.Is(err, ErrQueueFull):
+		// The parent pool is full. The caller can retry the submission.
+		p.droppedTaskCount.Add(1)
+	case errors.Is(err, ErrPoolStopped),
+		errors.Is(err, context.Canceled),
+		errors.Is(err, context.DeadlineExceeded):
+		// The parent pool is stopping or its context has been canceled.
+		joinedErr := errors.Join(ErrContextCanceled, err)
+		p.updateMetrics(joinedErr)
+		if parentAttempted && p.parent != nil {
+			p.parent.updateMetrics(joinedErr)
+		}
+	default:
+		// An unexpected rejection (e.g. an invalid submission) is a failure.
+		p.updateMetrics(err)
+		if parentAttempted && p.parent != nil {
+			p.parent.updateMetrics(err)
+		}
+	}
+}
+
+func (p *pool) drainQueuedTasks(err error) {
+	defer p.notifySubmitWaiter()
+
+	for {
+		entry, ok := p.popQueuedTask()
+		if !ok {
+			return
+		}
+
+		p.recordRejectedTask(err, false)
+		entry.reject(err)
+	}
+}
+
+func (p *pool) popQueuedTask() (*poolTask, bool) {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	if p.tasks.Len() == 0 {
+		return nil, false
+	}
+
+	entry, _ := p.tasks.Read()
+	return entry, true
 }
 
 func (p *pool) notifySubmitWaiter() {
@@ -612,7 +736,7 @@ func newPool(maxConcurrency int, parent *pool, options ...Option) *pool {
 
 	pool.ctx, pool.cancel = context.WithCancelCause(pool.ctx)
 
-	pool.tasks = linkedbuffer.NewLinkedBuffer[any](LinkedBufferInitialSize, LinkedBufferMaxCapacity)
+	pool.tasks = linkedbuffer.NewLinkedBuffer[*poolTask](LinkedBufferInitialSize, LinkedBufferMaxCapacity)
 
 	return pool
 }

@@ -86,7 +86,10 @@ func (p *resultPool[R]) submit(task any, nonBlocking bool) (ResultTask[R], bool)
 
 	wrapped := wrapTask[R, func(R, error)](task, resolve, ctx, p.pool.panicRecovery)
 
-	if err := p.pool.submit(wrapped, nonBlocking); err != nil {
+	if err := p.pool.submit(wrapped, nonBlocking, func(err error) {
+		var zero R
+		resolve(zero, err)
+	}); err != nil {
 		var zero R
 		resolve(zero, err)
 		return future, false

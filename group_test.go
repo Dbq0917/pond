@@ -510,3 +510,30 @@ func TestTaskGroupContext(t *testing.T) {
 	assert.Equal(t, uint64(2), pool.FailedTasks())
 	assert.Equal(t, uint64(1), pool.CanceledTasks())
 }
+
+func TestTaskGroupSubpoolParentFull(t *testing.T) {
+	parent := NewPool(1, WithQueueSize(0), WithNonBlocking(true))
+
+	releaseParent := make(chan struct{})
+	defer func() {
+		close(releaseParent)
+		parent.StopAndWait()
+	}()
+
+	parentStarted := make(chan struct{})
+	parent.Submit(func() {
+		close(parentStarted)
+		<-releaseParent
+	})
+	<-parentStarted
+
+	subpool := parent.NewSubpool(1)
+	group := subpool.NewGroup()
+	group.Submit(func() {})
+
+	err := group.Wait()
+
+	assert.Equal(t, ErrQueueFull, err)
+	assert.Equal(t, int64(0), subpool.RunningWorkers())
+	assert.Equal(t, uint64(0), subpool.WaitingTasks())
+}

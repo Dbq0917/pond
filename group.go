@@ -137,7 +137,13 @@ func (g *abstractTaskGroup[T, E, O]) submit(task any) {
 		}, err)
 
 		return err
-	}, g.pool.nonBlocking)
+	}, g.pool.nonBlocking, func(err error) {
+		g.taskWaitGroup.Done()
+
+		g.futureResolver(index, &result[O]{
+			Err: err,
+		}, err)
+	})
 
 	if err != nil {
 		g.taskWaitGroup.Done()

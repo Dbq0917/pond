@@ -294,6 +294,35 @@ func TestResultInterfaceCompatibility(t *testing.T) {
 	assert.Equal(t, 42, result)
 }
 
+func TestResultSubpoolParentFull(t *testing.T) {
+	parent := NewResultPool[int](1, WithQueueSize(0), WithNonBlocking(true))
+
+	releaseParent := make(chan struct{})
+	defer func() {
+		close(releaseParent)
+		parent.StopAndWait()
+	}()
+
+	parentStarted := make(chan struct{})
+	parent.Submit(func() int {
+		close(parentStarted)
+		<-releaseParent
+		return 0
+	})
+	<-parentStarted
+
+	subpool := parent.NewSubpool(1)
+
+	value, err := subpool.Submit(func() int {
+		return 1
+	}).Wait()
+
+	assert.Equal(t, 0, value)
+	assert.Equal(t, ErrQueueFull, err)
+	assert.Equal(t, int64(0), subpool.RunningWorkers())
+	assert.Equal(t, uint64(0), subpool.WaitingTasks())
+}
+
 func TestResultPoolSubmitContextCanceled(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
