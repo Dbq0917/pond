@@ -523,13 +523,15 @@ When resizing a pool:
 Each worker pool instance exposes useful metrics that can be queried through the following methods:
 
 - `pool.RunningWorkers() int64`: Current number of running workers
-- `pool.SubmittedTasks() uint64`: Total number of tasks submitted since the pool was created and before it was stopped. This includes tasks that were dropped because the queue was full
-- `pool.WaitingTasks() uint64`: Current number of tasks in the queue that are waiting to be executed
+- `pool.SubmittedTasks() uint64`: Total number of tasks accepted by the pool since it was created. Tasks rejected by a full queue or by a stopped pool are not counted here; full-queue rejections are counted by `DroppedTasks`
+- `pool.WaitingTasks() uint64`: Current number of accepted tasks waiting in the queue. It is reconciled from the same counters as `SubmittedTasks`, `CompletedTasks`, `CanceledTasks`, and `RunningWorkers`
 - `pool.SuccessfulTasks() uint64`: Total number of tasks that have successfully completed their execution since the pool was created
 - `pool.FailedTasks() uint64`: Total number of tasks that completed with a non-cancellation error (including panics) since the pool was created
 - `pool.CanceledTasks() uint64`: Total number of tasks accepted by the pool that were canceled before executing user code due to context cancellation
 - `pool.CompletedTasks() uint64`: Total number of tasks that have completed their execution either successfully or with a non-cancellation error since the pool was created
 - `pool.DroppedTasks() uint64`: Total number of tasks that were dropped because the queue was full since the pool was created
+
+At a consistent snapshot, queue depth follows the ledger identity `WaitingTasks = SubmittedTasks - CompletedTasks - CanceledTasks - RunningWorkers`; rejected submissions never enter `SubmittedTasks`.
 
 In our [Prometheus example](./examples/prometheus/main.go) we showcase how to configure collectors for these metrics and expose them to Prometheus.
 

@@ -373,6 +373,14 @@ func TestPoolWithQueueSizeAndNonBlocking(t *testing.T) {
 	// Submit a task that should be dropped
 	task := pool.Submit(func() {})
 
+	assert.Equal(t, uint64(20), pool.SubmittedTasks())
+	assert.Equal(t, uint64(10), pool.WaitingTasks())
+	assert.Equal(t, int64(10), pool.RunningWorkers())
+	assert.Equal(t, uint64(0), pool.CompletedTasks())
+	assert.Equal(t, uint64(1), pool.DroppedTasks())
+	assert.Equal(t, uint64(21), pool.SubmittedTasks()+pool.DroppedTasks())
+	assert.Equal(t, pool.WaitingTasks(), pool.SubmittedTasks()-pool.CompletedTasks()-uint64(pool.RunningWorkers()))
+
 	// Unblock tasks
 	close(taskWait)
 
@@ -380,6 +388,12 @@ func TestPoolWithQueueSizeAndNonBlocking(t *testing.T) {
 	assert.Equal(t, uint64(1), pool.DroppedTasks())
 
 	pool.Stop().Wait()
+
+	assert.Equal(t, uint64(20), pool.SubmittedTasks())
+	assert.Equal(t, uint64(20), pool.CompletedTasks())
+	assert.Equal(t, uint64(1), pool.DroppedTasks())
+	assert.Equal(t, uint64(0), pool.WaitingTasks())
+	assert.Equal(t, uint64(21), pool.SubmittedTasks()+pool.DroppedTasks())
 }
 
 func TestPoolWithQueueSizeZero(t *testing.T) {
@@ -436,7 +450,7 @@ func TestPoolWithQueueSizeZero(t *testing.T) {
 
 	assert.Equal(t, nil, firstTask.Wait())
 	assert.Equal(t, uint64(0), pool.WaitingTasks())
-	assert.Equal(t, uint64(3), pool.SubmittedTasks())
+	assert.Equal(t, uint64(2), pool.SubmittedTasks())
 	assert.Equal(t, uint64(2), pool.CompletedTasks())
 	assert.Equal(t, uint64(2), pool.SuccessfulTasks())
 	assert.Equal(t, uint64(0), pool.FailedTasks())
@@ -853,7 +867,7 @@ func TestPoolTrySubmit(t *testing.T) {
 	assert.Equal(t, ErrQueueFull, task3.Wait())
 
 	// Verify metrics
-	assert.Equal(t, uint64(3), pool.SubmittedTasks())
+	assert.Equal(t, uint64(2), pool.SubmittedTasks())
 	assert.Equal(t, uint64(2), pool.CompletedTasks())
 	assert.Equal(t, uint64(2), pool.SuccessfulTasks())
 	assert.Equal(t, uint64(0), pool.FailedTasks())
@@ -900,11 +914,97 @@ func TestPoolTrySubmitErr(t *testing.T) {
 	assert.Equal(t, ErrQueueFull, task3.Wait())
 
 	// Verify metrics
-	assert.Equal(t, uint64(3), pool.SubmittedTasks())
+	assert.Equal(t, uint64(2), pool.SubmittedTasks())
 	assert.Equal(t, uint64(2), pool.CompletedTasks())
 	assert.Equal(t, uint64(1), pool.SuccessfulTasks())
 	assert.Equal(t, uint64(1), pool.FailedTasks())
 	assert.Equal(t, uint64(1), pool.DroppedTasks())
+}
+
+func TestPoolStoppedSubmissionsAreNotMetered(t *testing.T) {
+	pool := NewPool(1)
+	pool.StopAndWait()
+
+	err := pool.Go(func() {})
+	assert.True(t, errors.Is(err, ErrPoolStopped))
+
+	task, ok := pool.TrySubmit(func() {})
+	assert.True(t, !ok)
+	assert.Equal(t, ErrPoolStopped, task.Wait())
+
+	assert.Equal(t, uint64(0), pool.SubmittedTasks())
+	assert.Equal(t, uint64(0), pool.DroppedTasks())
+	assert.Equal(t, uint64(0), pool.CompletedTasks())
+	assert.Equal(t, uint64(0), pool.WaitingTasks())
+}
+
+func TestPoolBlockingSubmitCountsAcceptedTaskOnce(t *testing.T) {
+	pool := NewPool(1, WithQueueSize(1))
+
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	pool.Submit(func() {
+		close(firstStarted)
+		<-releaseFirst
+	})
+	<-firstStarted
+
+	pool.Submit(func() {})
+
+	submitDone := make(chan error, 1)
+	go func() {
+		submitDone <- pool.Go(func() {})
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	assert.Equal(t, uint64(2), pool.SubmittedTasks())
+	assert.Equal(t, uint64(1), pool.WaitingTasks())
+
+	close(releaseFirst)
+	assert.Equal(t, nil, <-submitDone)
+
+	pool.StopAndWait()
+
+	assert.Equal(t, uint64(3), pool.SubmittedTasks())
+	assert.Equal(t, uint64(3), pool.CompletedTasks())
+	assert.Equal(t, uint64(0), pool.DroppedTasks())
+	assert.Equal(t, uint64(0), pool.WaitingTasks())
+}
+
+func TestPoolBlockingSubmitCanceledWhileWaitingIsNotMetered(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	pool := NewPool(1, WithQueueSize(1), WithContext(ctx))
+
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	pool.Submit(func() {
+		close(firstStarted)
+		<-releaseFirst
+	})
+	<-firstStarted
+
+	pool.Submit(func() {})
+
+	submitDone := make(chan error, 1)
+	go func() {
+		submitDone <- pool.Go(func() {})
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	cancel()
+
+	err := <-submitDone
+	assert.True(t, errors.Is(err, context.Canceled))
+	assert.Equal(t, uint64(2), pool.SubmittedTasks())
+	assert.Equal(t, uint64(0), pool.DroppedTasks())
+
+	close(releaseFirst)
+	pool.StopAndWait()
+
+	assert.Equal(t, uint64(2), pool.SubmittedTasks())
+	assert.Equal(t, uint64(1), pool.CompletedTasks())
+	assert.Equal(t, uint64(1), pool.CanceledTasks())
+	assert.Equal(t, uint64(0), pool.WaitingTasks())
 }
 
 // TestStopAndWaitWithGoexit reproduces issue #135: StopAndWait() blocks indefinitely

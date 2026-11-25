@@ -39,7 +39,8 @@ type BasePool interface {
 	// Returns the number of worker goroutines that are currently active (executing a task) in the pool.
 	RunningWorkers() int64
 
-	// Returns the total number of tasks submitted to the pool since its creation.
+	// Returns the total number of tasks accepted by the pool since its creation.
+	// Rejected submissions are accounted for by DroppedTasks instead.
 	SubmittedTasks() uint64
 
 	// Returns the number of tasks that are currently waiting in the pool's queue.
@@ -136,24 +137,28 @@ type Pool interface {
 }
 
 type pool struct {
-	mutex               sync.Mutex
-	parent              *pool
-	ctx                 context.Context
-	cancel              context.CancelCauseFunc
-	nonBlocking         bool
-	panicRecovery       bool
-	maxConcurrency      int
-	closed              atomic.Bool
-	workerCount         atomic.Int64
-	workerWaitGroup     sync.WaitGroup
-	submitWaiters       chan struct{}
-	queueSize           int
-	tasks               *linkedbuffer.LinkedBuffer[any]
-	submittedTaskCount  atomic.Uint64
-	successfulTaskCount atomic.Uint64
-	failedTaskCount     atomic.Uint64
-	droppedTaskCount    atomic.Uint64
-	canceledTaskCount   atomic.Uint64
+	mutex           sync.Mutex
+	parent          *pool
+	ctx             context.Context
+	cancel          context.CancelCauseFunc
+	nonBlocking     bool
+	panicRecovery   bool
+	maxConcurrency  int
+	closed          atomic.Bool
+	workerCount     int64
+	workerWaitGroup sync.WaitGroup
+	submitWaiters   chan struct{}
+	queueSize       int
+	tasks           *linkedbuffer.LinkedBuffer[any]
+	metrics         poolMetrics
+}
+
+type poolMetrics struct {
+	submitted  uint64
+	successful uint64
+	failed     uint64
+	dropped    uint64
+	canceled   uint64
 }
 
 func (p *pool) Context() context.Context {
@@ -183,7 +188,7 @@ func (p *pool) Resize(maxConcurrency int) {
 	p.mutex.Lock()
 
 	// Workers from an earlier limit can still be running after a shrink.
-	newWorkers := maxConcurrency - int(p.workerCount.Load())
+	newWorkers := maxConcurrency - int(p.workerCount)
 	if queuedTasks := int(p.tasks.Len()); newWorkers > queuedTasks {
 		newWorkers = queuedTasks
 	}
@@ -191,7 +196,7 @@ func (p *pool) Resize(maxConcurrency int) {
 	p.maxConcurrency = maxConcurrency
 
 	if newWorkers > 0 {
-		p.workerCount.Add(int64(newWorkers))
+		p.workerCount += int64(newWorkers)
 		p.workerWaitGroup.Add(newWorkers)
 	}
 
@@ -212,38 +217,67 @@ func (p *pool) NonBlocking() bool {
 }
 
 func (p *pool) RunningWorkers() int64 {
-	return p.workerCount.Load()
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	return p.workerCount
 }
 
 func (p *pool) SubmittedTasks() uint64 {
-	return p.submittedTaskCount.Load()
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	return p.metrics.submitted
 }
 
 func (p *pool) WaitingTasks() uint64 {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 
-	return p.tasks.Len()
+	return p.waitingTasksLocked()
 }
 
 func (p *pool) FailedTasks() uint64 {
-	return p.failedTaskCount.Load()
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	return p.metrics.failed
 }
 
 func (p *pool) SuccessfulTasks() uint64 {
-	return p.successfulTaskCount.Load()
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	return p.metrics.successful
 }
 
 func (p *pool) CompletedTasks() uint64 {
-	return p.successfulTaskCount.Load() + p.failedTaskCount.Load()
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	return p.metrics.successful + p.metrics.failed
 }
 
 func (p *pool) DroppedTasks() uint64 {
-	return p.droppedTaskCount.Load()
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	return p.metrics.dropped
 }
 
 func (p *pool) CanceledTasks() uint64 {
-	return p.canceledTaskCount.Load()
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	return p.metrics.canceled
+}
+
+func (p *pool) waitingTasksLocked() uint64 {
+	return p.metrics.submitted -
+		p.metrics.successful -
+		p.metrics.failed -
+		p.metrics.canceled -
+		uint64(p.workerCount)
 }
 
 func (p *pool) worker(task any) {
@@ -253,27 +287,23 @@ func (p *pool) worker(task any) {
 		if !exitedNormally {
 			// In case of abnormal exit (e.g. runtime.Goexit() in the task),
 			// launch a new worker to execute the next task in the queue.
-			p.updateMetrics(fmt.Errorf("worker exited abnormally: %w", err))
-
-			task, err := p.readTask()
-			if err != nil {
+			nextTask, readErr := p.completeAndReadTask(fmt.Errorf("worker exited abnormally: %w", err))
+			if readErr != nil {
 				return
 			}
 
-			if task != nil {
-				p.launchWorker(task)
-				p.notifySubmitWaiter()
+			if nextTask != nil {
+				p.launchWorker(nextTask)
 			}
 		}
 	}()
 	for {
 		if task != nil {
 			_, err = invokeTask[any](task, p.panicRecovery)
-
-			p.updateMetrics(err)
+			task, readTaskErr = p.completeAndReadTask(err)
+		} else {
+			task, readTaskErr = p.readTask()
 		}
-
-		task, readTaskErr = p.readTask()
 
 		if readTaskErr != nil {
 			exitedNormally = true
@@ -285,10 +315,11 @@ func (p *pool) worker(task any) {
 func (p *pool) subpoolWorker(task any) func() (output any, err error) {
 	return func() (output any, err error) {
 		exitedNormally := false
+		var nextErr error
 		defer func() {
 			if !exitedNormally {
-				p.updateMetrics(fmt.Errorf("worker exited abnormally: %w", err))
-				if nextTask, readErr := p.readTask(); readErr == nil {
+				nextTask, readErr := p.completeAndReadTask(fmt.Errorf("worker exited abnormally: %w", err))
+				if readErr == nil {
 					p.launchWorker(nextTask)
 				}
 			}
@@ -296,33 +327,29 @@ func (p *pool) subpoolWorker(task any) func() (output any, err error) {
 
 		if task != nil {
 			output, err = invokeTask[any](task, p.panicRecovery)
-
-			p.updateMetrics(err)
+			task, nextErr = p.completeAndReadTask(err)
+		} else {
+			task, nextErr = p.readTask()
 		}
 
 		exitedNormally = true
 
 		// Attempt to submit the next task to the parent pool
-		if task, err := p.readTask(); err == nil {
-			for {
-				submitErr := p.parent.submit(p.subpoolWorker(task), p.nonBlocking)
-				if submitErr == nil {
-					break
-				}
+		for nextErr == nil && task != nil {
+			submitErr := p.parent.submit(p.subpoolWorker(task), p.nonBlocking)
+			if submitErr == nil {
+				break
+			}
 
-				// Wrap the error with the context canceled error to reflect that the task was canceled.
-				if errors.Is(submitErr, ErrPoolStopped) {
-					err = errors.Join(ErrContextCanceled, submitErr)
-					p.updateMetrics(err)
-					p.parent.updateMetrics(err)
-				}
+			// Wrap the error with the context canceled error to reflect that the task was canceled.
+			if errors.Is(submitErr, ErrPoolStopped) {
+				task, nextErr = p.completeAndReadTask(errors.Join(ErrContextCanceled, submitErr))
+				continue
+			}
 
-				// If the parent pool is stopped/canceled it won't accept submissions.
-				// Keep draining the subpool queue so workers can exit cleanly.
-				task, err = p.readTask()
-				if err != nil {
-					break
-				}
+			task, nextErr = p.readTask()
+			if nextErr != nil {
+				break
 			}
 		}
 
@@ -378,17 +405,10 @@ func (p *pool) wrapTask(task any) (Task, func() error, func(error)) {
 }
 
 func (p *pool) submit(task any, nonBlocking bool) (err error) {
-
-	p.submittedTaskCount.Add(1)
-
 	if nonBlocking {
-		err = p.trySubmit(task)
+		err = p.trySubmit(task, true)
 	} else {
 		err = p.blockingTrySubmit(task)
-	}
-
-	if err != nil {
-		p.droppedTaskCount.Add(1)
 	}
 
 	return
@@ -396,7 +416,7 @@ func (p *pool) submit(task any, nonBlocking bool) (err error) {
 
 func (p *pool) blockingTrySubmit(task any) error {
 	for {
-		if err := p.trySubmit(task); err != ErrQueueFull {
+		if err := p.trySubmit(task, false); err != ErrQueueFull {
 			return err
 		}
 
@@ -414,7 +434,7 @@ func (p *pool) blockingTrySubmit(task any) error {
 	}
 }
 
-func (p *pool) trySubmit(task any) error {
+func (p *pool) trySubmit(task any, accountDropped bool) error {
 	p.mutex.Lock()
 
 	// Check if the pool has been stopped while holding the lock
@@ -429,24 +449,32 @@ func (p *pool) trySubmit(task any) error {
 
 	// When queue is enabled, check if it is full
 	if queueEnabled && tasksLen >= p.queueSize {
+		if accountDropped {
+			p.metrics.dropped++
+		}
 		p.mutex.Unlock()
 		return ErrQueueFull
 	}
 
-	if int(p.workerCount.Load()) >= p.maxConcurrency {
+	if p.workerCount >= int64(p.maxConcurrency) {
 		// When queue is disabled, return an error immediately if max concurrency is reached
 		if !queueEnabled {
+			if accountDropped {
+				p.metrics.dropped++
+			}
 			p.mutex.Unlock()
 			return ErrQueueFull
 		}
 
 		// If queue is enabled, push the task at the back of the queue
+		p.metrics.submitted++
 		p.tasks.Write(task)
 		p.mutex.Unlock()
 		return nil
 	}
 
-	p.workerCount.Add(1)
+	p.metrics.submitted++
+	p.workerCount++
 	p.workerWaitGroup.Add(1)
 
 	if queueEnabled && tasksLen > 0 {
@@ -480,37 +508,43 @@ func (p *pool) launchWorker(task any) {
 
 func (p *pool) readTask() (task any, err error) {
 	p.mutex.Lock()
+	task, err = p.readTaskLocked()
+	p.mutex.Unlock()
 
+	p.notifySubmitWaiter()
+
+	return
+}
+
+func (p *pool) completeAndReadTask(result error) (task any, err error) {
+	p.mutex.Lock()
+	p.recordCompletionLocked(result)
+	task, err = p.readTaskLocked()
+	p.mutex.Unlock()
+
+	p.notifySubmitWaiter()
+
+	return
+}
+
+func (p *pool) readTaskLocked() (task any, err error) {
 	if p.tasks.Len() == 0 {
 		// No more tasks in the queue, worker will exit
-		p.workerCount.Add(-1)
+		p.workerCount--
 		p.workerWaitGroup.Done()
-		p.mutex.Unlock()
-
-		// Notify a submit waiter there is room in the queue for a new task
-		p.notifySubmitWaiter()
-
 		err = ErrQueueEmpty
 		return
 	}
 
-	if p.maxConcurrency > 0 && int(p.workerCount.Load()) > p.maxConcurrency {
+	if p.maxConcurrency > 0 && p.workerCount > int64(p.maxConcurrency) {
 		// Max concurrency reached, kill the worker
-		p.workerCount.Add(-1)
+		p.workerCount--
 		p.workerWaitGroup.Done()
-		p.mutex.Unlock()
-
 		err = ErrMaxConcurrencyReached
 		return
 	}
 
 	task, _ = p.tasks.Read()
-
-	p.mutex.Unlock()
-
-	// Notify a submit waiter there is room in the queue for a new task
-	p.notifySubmitWaiter()
-
 	return
 }
 
@@ -523,15 +557,15 @@ func (p *pool) notifySubmitWaiter() {
 	}
 }
 
-func (p *pool) updateMetrics(err error) {
+func (p *pool) recordCompletionLocked(err error) {
 	if err != nil {
 		if errors.Is(err, ErrContextCanceled) {
-			p.canceledTaskCount.Add(1)
+			p.metrics.canceled++
 		} else {
-			p.failedTaskCount.Add(1)
+			p.metrics.failed++
 		}
 	} else {
-		p.successfulTaskCount.Add(1)
+		p.metrics.successful++
 	}
 }
 

@@ -160,7 +160,7 @@ func TestResultPoolTrySubmit(t *testing.T) {
 	assert.Equal(t, 0, result)
 
 	// Verify metrics
-	assert.Equal(t, uint64(3), pool.SubmittedTasks())
+	assert.Equal(t, uint64(2), pool.SubmittedTasks())
 	assert.Equal(t, uint64(2), pool.CompletedTasks())
 	assert.Equal(t, uint64(2), pool.SuccessfulTasks())
 	assert.Equal(t, uint64(0), pool.FailedTasks())
@@ -216,7 +216,7 @@ func TestResultPoolTrySubmitErr(t *testing.T) {
 	assert.Equal(t, 0, result)
 
 	// Verify metrics
-	assert.Equal(t, uint64(3), pool.SubmittedTasks())
+	assert.Equal(t, uint64(2), pool.SubmittedTasks())
 	assert.Equal(t, uint64(2), pool.CompletedTasks())
 	assert.Equal(t, uint64(1), pool.SuccessfulTasks())
 	assert.Equal(t, uint64(1), pool.FailedTasks())

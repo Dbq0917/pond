@@ -241,12 +241,12 @@ func TestSubpoolStopAndWaitShouldNotDeadlockWhenContextCanceledWithQueuedTasks(t
 	assert.Equal(t, uint64(0), subpool.WaitingTasks())
 	assert.Equal(t, int64(0), subpool.RunningWorkers())
 
-	assert.Equal(t, uint64(2), parentPool.SubmittedTasks())
+	assert.Equal(t, uint64(1), parentPool.SubmittedTasks())
 	assert.Equal(t, uint64(1), parentPool.CompletedTasks())
 	assert.Equal(t, uint64(1), parentPool.SuccessfulTasks())
 	assert.Equal(t, uint64(0), parentPool.FailedTasks())
-	assert.Equal(t, uint64(1), parentPool.CanceledTasks())
-	assert.Equal(t, uint64(1), parentPool.DroppedTasks())
+	assert.Equal(t, uint64(0), parentPool.CanceledTasks())
+	assert.Equal(t, uint64(0), parentPool.DroppedTasks())
 	assert.Equal(t, uint64(0), parentPool.WaitingTasks())
 	assert.Equal(t, int64(0), parentPool.RunningWorkers())
 }
@@ -384,7 +384,7 @@ func TestSubpoolWithQueueSizeOverride(t *testing.T) {
 	}
 
 	assert.Equal(t, int64(1), subpool.RunningWorkers())
-	assert.Equal(t, uint64(11), subpool.SubmittedTasks())
+	assert.Equal(t, uint64(3), subpool.SubmittedTasks())
 	assert.Equal(t, uint64(0), subpool.CompletedTasks())
 	assert.Equal(t, uint64(8), subpool.DroppedTasks())
 	assert.Equal(t, uint64(2), subpool.WaitingTasks())
