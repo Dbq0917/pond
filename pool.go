@@ -34,6 +34,16 @@ var (
 	}()
 )
 
+// stopTask is an internal sentinel queued behind all pending tasks when a pool
+// is stopped. It is handled by an existing worker, so stopping a pool never
+// depends on another pool's workers.
+type stopTask struct{}
+
+func isStopTask(task any) bool {
+	_, ok := task.(stopTask)
+	return ok
+}
+
 // BasePool defines methods common to all pool types.
 type BasePool interface {
 	// Returns the number of worker goroutines that are currently active (executing a task) in the pool.
@@ -149,6 +159,9 @@ type pool struct {
 	submitWaiters       chan struct{}
 	queueSize           int
 	tasks               *linkedbuffer.LinkedBuffer[any]
+	stopFuture          Task
+	stopResolve         future.FutureResolver
+	stopCompleteOnce    sync.Once
 	submittedTaskCount  atomic.Uint64
 	successfulTaskCount atomic.Uint64
 	failedTaskCount     atomic.Uint64
@@ -260,6 +273,11 @@ func (p *pool) worker(task any) {
 				return
 			}
 
+			if isStopTask(task) {
+				p.finishStop()
+				return
+			}
+
 			if task != nil {
 				p.launchWorker(task)
 				p.notifySubmitWaiter()
@@ -267,6 +285,12 @@ func (p *pool) worker(task any) {
 		}
 	}()
 	for {
+		if isStopTask(task) {
+			p.finishStop()
+			exitedNormally = true
+			return
+		}
+
 		if task != nil {
 			_, err = invokeTask[any](task, p.panicRecovery)
 
@@ -289,10 +313,20 @@ func (p *pool) subpoolWorker(task any) func() (output any, err error) {
 			if !exitedNormally {
 				p.updateMetrics(fmt.Errorf("worker exited abnormally: %w", err))
 				if nextTask, readErr := p.readTask(); readErr == nil {
+					if isStopTask(nextTask) {
+						p.finishStop()
+						return
+					}
 					p.launchWorker(nextTask)
 				}
 			}
 		}()
+
+		if isStopTask(task) {
+			p.finishStop()
+			exitedNormally = true
+			return
+		}
 
 		if task != nil {
 			output, err = invokeTask[any](task, p.panicRecovery)
@@ -303,24 +337,29 @@ func (p *pool) subpoolWorker(task any) func() (output any, err error) {
 		exitedNormally = true
 
 		// Attempt to submit the next task to the parent pool
-		if task, err := p.readTask(); err == nil {
+		if nextTask, readErr := p.readTask(); readErr == nil {
 			for {
-				submitErr := p.parent.submit(p.subpoolWorker(task), p.nonBlocking)
+				if isStopTask(nextTask) {
+					p.finishStop()
+					return
+				}
+
+				submitErr := p.parent.submit(p.subpoolWorker(nextTask), p.nonBlocking)
 				if submitErr == nil {
 					break
 				}
 
 				// Wrap the error with the context canceled error to reflect that the task was canceled.
 				if errors.Is(submitErr, ErrPoolStopped) {
-					err = errors.Join(ErrContextCanceled, submitErr)
-					p.updateMetrics(err)
-					p.parent.updateMetrics(err)
+					canceledErr := errors.Join(ErrContextCanceled, submitErr)
+					p.updateMetrics(canceledErr)
+					p.parent.updateMetrics(canceledErr)
 				}
 
 				// If the parent pool is stopped/canceled it won't accept submissions.
 				// Keep draining the subpool queue so workers can exit cleanly.
-				task, err = p.readTask()
-				if err != nil {
+				nextTask, readErr = p.readTask()
+				if readErr != nil {
 					break
 				}
 			}
@@ -536,22 +575,69 @@ func (p *pool) updateMetrics(err error) {
 }
 
 func (p *pool) Stop() Task {
-	return Submit(func() {
-		// Stop accepting new tasks while holding the lock to avoid race conditions.
-		p.mutex.Lock()
-		p.closed.Store(true)
+	p.mutex.Lock()
+
+	if p.stopFuture != nil {
+		stopFuture := p.stopFuture
+		p.mutex.Unlock()
+		return stopFuture
+	}
+
+	stopFuture, stopResolve := future.NewFuture(context.Background())
+	p.stopFuture = stopFuture
+	p.stopResolve = stopResolve
+
+	// Stop accepting new tasks while holding the lock to avoid race conditions.
+	p.closed.Store(true)
+
+	if int(p.workerCount.Load()) == 0 {
 		p.mutex.Unlock()
 
-		// Wait for all workers to finish executing all tasks (including the ones in the queue)
-		p.workerWaitGroup.Wait()
+		// There is no worker that could execute the stop sentinel, which also
+		// means there are no pending tasks to wait for.
+		p.completeStop(nil)
+		return stopFuture
+	}
 
-		// Cancel the context with a pool stopped error to signal that the pool has been stopped
-		p.cancel(ErrPoolStopped)
-	})
+	// Queue the stop sentinel behind all pending tasks. Existing workers will
+	// pick it up once they have drained the tasks submitted before Stop.
+	p.tasks.Write(stopTask{})
+
+	p.mutex.Unlock()
+
+	p.notifySubmitWaiter()
+
+	return stopFuture
 }
 
 func (p *pool) StopAndWait() {
 	p.Stop().Wait()
+}
+
+func (p *pool) finishStop() {
+	// The worker executing the stop sentinel must not wait for itself.
+	p.workerCount.Add(-1)
+	p.workerWaitGroup.Done()
+
+	// Wait for all workers to finish executing all tasks (including the ones in the queue)
+	p.workerWaitGroup.Wait()
+
+	p.completeStop(nil)
+}
+
+func (p *pool) completeStop(err error) {
+	p.stopCompleteOnce.Do(func() {
+		p.mutex.Lock()
+		stopResolve := p.stopResolve
+		p.mutex.Unlock()
+
+		// Cancel the context with a pool stopped error to signal that the pool has been stopped.
+		p.cancel(ErrPoolStopped)
+
+		if stopResolve != nil {
+			stopResolve(err)
+		}
+	})
 }
 
 func (p *pool) NewSubpool(maxConcurrency int, options ...Option) Pool {
