@@ -22,6 +22,7 @@ Some common use cases include:
 - Zero dependencies
 - Create pools of goroutines that scale automatically based on the number of tasks submitted
 - Limit the number of concurrent tasks running at the same time
+- Priority task scheduling: urgent tasks jump ahead of background batches, FIFO is preserved within a priority level, and low priority tasks are guaranteed not to starve
 - Worker goroutines are only created when needed and immediately removed when idle (scale to zero)
 - Minimalistic and fluent APIs for:
   - Creating worker pools with maximum number of workers
@@ -483,6 +484,48 @@ if _, ok := pool.TrySubmit(func() {
 	// All 4 workers were busy so the task was rejected
 }
 ```
+
+### Task priorities
+
+When urgent, latency-sensitive tasks (for example an online request) share a pool with slow background batch work (for example uploads), a plain FIFO queue makes the urgent task wait behind the entire batch. Priorities let urgent tasks jump ahead of lower priority queued tasks.
+
+Three named levels are provided, and the zero value (`pond.PriorityNormal`) keeps the default FIFO behavior for existing code:
+
+- `pond.PriorityLow` (alias `pond.PriorityBackground`) for deferrable batch work.
+- `pond.PriorityNormal` (alias `pond.PriorityDefault`).
+- `pond.PriorityHigh` (alias `pond.PriorityUrgent`) for urgent work.
+
+Tasks with a higher priority are always dequeued first, while tasks sharing a priority level preserve submission (FIFO) order. Low priority tasks cannot starve: after a waiting low priority lane has been overtaken a bounded number of times, the scheduler services it before another higher priority task.
+
+```go
+pool := pond.NewPool(4)
+
+// Background batch work is enqueued first...
+for _, upload := range uploads {
+	upload := upload
+	pool.GoWithPriority(pond.PriorityLow, func() {
+		upload()
+	})
+}
+
+// ...an urgent task submitted later jumps the queue.
+future := pool.SubmitWithPriority(pond.PriorityUrgent, func() {
+	// Handle the online request
+})
+if err := future.Wait(); err != nil {
+	// ...
+}
+```
+
+Priorities can also be passed as task options to the regular submission methods, which keeps existing call sites working:
+
+```go
+pool.Submit(func() {
+	// Urgent work
+}, pond.WithPriority(pond.PriorityHigh))
+```
+
+The queue size configured with `WithQueueSize` is a **shared total** across all priority levels, so adding priorities does not multiply queue capacity. Priority bookkeeping reuses the pool's existing submission critical section and introduces no additional lock per submission. The same `...WithPriority` methods and `pond.WithPriority` option are available on `pond.ResultPool` as well.
 
 ### Resizing pools (v2)
 

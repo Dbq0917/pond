@@ -9,7 +9,6 @@ import (
 	"sync/atomic"
 
 	"github.com/alitto/pond/v2/internal/future"
-	"github.com/alitto/pond/v2/internal/linkedbuffer"
 )
 
 const (
@@ -99,31 +98,59 @@ type Pool interface {
 	// Submits a task to the pool without waiting for it to complete.
 	// The pool will not accept new tasks after it has been stopped.
 	// If the pool has been stopped, this method will return ErrPoolStopped.
-	Go(task func()) error
+	// Task options such as WithPriority may be passed to set the priority.
+	Go(task func(), options ...TaskOption) error
 
 	// Submits a task to the pool and returns a future that can be used to wait for the task to complete.
 	// The pool will not accept new tasks after it has been stopped.
 	// If the pool has been stopped, the returned future will resolve to ErrPoolStopped.
-	Submit(task func()) Task
+	// Task options such as WithPriority may be passed to set the priority.
+	Submit(task func(), options ...TaskOption) Task
 
 	// Submits a task to the pool and returns a future that can be used to wait for the task to complete.
 	// The task function must return an error.
 	// The pool will not accept new tasks after it has been stopped.
 	// If the pool has been stopped, the returned future will resolve to ErrPoolStopped.
-	SubmitErr(task func() error) Task
+	// Task options such as WithPriority may be passed to set the priority.
+	SubmitErr(task func() error, options ...TaskOption) Task
 
 	// Attempts to submit a task to the pool and returns a future that can be used to wait for the task to complete
 	// and a boolean indicating whether the task was submitted successfully.
 	// The pool will not accept new tasks after it has been stopped.
 	// If the pool has been stopped, the returned future will resolve to ErrPoolStopped.
-	TrySubmit(task func()) (Task, bool)
+	// Task options such as WithPriority may be passed to set the priority.
+	TrySubmit(task func(), options ...TaskOption) (Task, bool)
 
 	// Attempts to submit a task to the pool and returns a future that can be used to wait for the task to complete
 	// and a boolean indicating whether the task was submitted successfully.
 	// The task function must return an error.
 	// The pool will not accept new tasks after it has been stopped.
 	// If the pool has been stopped, the returned future will resolve to ErrPoolStopped.
-	TrySubmitErr(task func() error) (Task, bool)
+	// Task options such as WithPriority may be passed to set the priority.
+	TrySubmitErr(task func() error, options ...TaskOption) (Task, bool)
+
+	// GoWithPriority submits a task at the given priority without waiting for it.
+	// Higher priority tasks jump ahead of lower priority queued tasks, tasks with
+	// the same priority keep FIFO order, and low priority tasks are guaranteed
+	// not to starve. See Go for the rest of the submission semantics.
+	GoWithPriority(priority Priority, task func()) error
+
+	// SubmitWithPriority submits a task at the given priority and returns a future.
+	// Higher priority tasks jump ahead of lower priority queued tasks.
+	// See Submit for the rest of the submission semantics.
+	SubmitWithPriority(priority Priority, task func()) Task
+
+	// SubmitErrWithPriority submits an error-returning task at the given priority.
+	// See SubmitErr for the rest of the submission semantics.
+	SubmitErrWithPriority(priority Priority, task func() error) Task
+
+	// TrySubmitWithPriority attempts a non-blocking submission at the given priority.
+	// See TrySubmit for the rest of the submission semantics.
+	TrySubmitWithPriority(priority Priority, task func()) (Task, bool)
+
+	// TrySubmitErrWithPriority is the error-returning variant of
+	// TrySubmitWithPriority. See TrySubmitErr for details.
+	TrySubmitErrWithPriority(priority Priority, task func() error) (Task, bool)
 
 	// Creates a new subpool with the specified maximum concurrency and options.
 	NewSubpool(maxConcurrency int, options ...Option) Pool
@@ -148,7 +175,7 @@ type pool struct {
 	workerWaitGroup     sync.WaitGroup
 	submitWaiters       chan struct{}
 	queueSize           int
-	tasks               *linkedbuffer.LinkedBuffer[any]
+	queue               *priorityQueue
 	submittedTaskCount  atomic.Uint64
 	successfulTaskCount atomic.Uint64
 	failedTaskCount     atomic.Uint64
@@ -184,7 +211,7 @@ func (p *pool) Resize(maxConcurrency int) {
 
 	// Workers from an earlier limit can still be running after a shrink.
 	newWorkers := maxConcurrency - int(p.workerCount.Load())
-	if queuedTasks := int(p.tasks.Len()); newWorkers > queuedTasks {
+	if queuedTasks := p.queue.Len(); newWorkers > queuedTasks {
 		newWorkers = queuedTasks
 	}
 
@@ -223,7 +250,7 @@ func (p *pool) WaitingTasks() uint64 {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 
-	return p.tasks.Len()
+	return uint64(p.queue.Len())
 }
 
 func (p *pool) FailedTasks() uint64 {
@@ -330,37 +357,45 @@ func (p *pool) subpoolWorker(task any) func() (output any, err error) {
 	}
 }
 
-func (p *pool) Go(task func()) error {
+func (p *pool) Go(task func(), options ...TaskOption) error {
+	config := resolveTaskConfig(options)
+
 	// Wrap the task so it is skipped if the pool context is canceled while it is queued
-	return p.submit(wrapTask[struct{}, func(error)](task, func(error) {}, p.ctx, p.panicRecovery), p.nonBlocking)
+	wrappedTask := wrapTask[struct{}, func(error)](task, func(error) {}, p.ctx, p.panicRecovery)
+
+	return p.submitWithPriority(wrappedTask, config.priority, p.nonBlocking)
 }
 
-func (p *pool) Submit(task func()) Task {
-	future, _ := p.wrapAndSubmit(task, p.nonBlocking)
+func (p *pool) Submit(task func(), options ...TaskOption) Task {
+	config := resolveTaskConfig(options)
+	future, _ := p.wrapAndSubmitWithPriority(task, config.priority, p.nonBlocking)
 	return future
 }
 
-func (p *pool) SubmitErr(task func() error) Task {
-	future, _ := p.wrapAndSubmit(task, p.nonBlocking)
+func (p *pool) SubmitErr(task func() error, options ...TaskOption) Task {
+	config := resolveTaskConfig(options)
+	future, _ := p.wrapAndSubmitWithPriority(task, config.priority, p.nonBlocking)
 	return future
 }
 
-func (p *pool) TrySubmit(task func()) (Task, bool) {
-	return p.wrapAndSubmit(task, true)
+func (p *pool) TrySubmit(task func(), options ...TaskOption) (Task, bool) {
+	config := resolveTaskConfig(options)
+	return p.wrapAndSubmitWithPriority(task, config.priority, true)
 }
 
-func (p *pool) TrySubmitErr(task func() error) (Task, bool) {
-	return p.wrapAndSubmit(task, true)
+func (p *pool) TrySubmitErr(task func() error, options ...TaskOption) (Task, bool) {
+	config := resolveTaskConfig(options)
+	return p.wrapAndSubmitWithPriority(task, config.priority, true)
 }
 
-func (p *pool) wrapAndSubmit(task any, nonBlocking bool) (Task, bool) {
+func (p *pool) wrapAndSubmitWithPriority(task any, priority Priority, nonBlocking bool) (Task, bool) {
 	if p.Stopped() {
 		return poolStoppedFuture, false
 	}
 
 	future, wrappedTask, resolve := p.wrapTask(task)
 
-	if err := p.submit(wrappedTask, nonBlocking); err != nil {
+	if err := p.submitWithPriority(wrappedTask, priority, nonBlocking); err != nil {
 		resolve(err)
 		return future, false
 	}
@@ -378,13 +413,17 @@ func (p *pool) wrapTask(task any) (Task, func() error, func(error)) {
 }
 
 func (p *pool) submit(task any, nonBlocking bool) (err error) {
+	return p.submitWithPriority(task, PriorityNormal, nonBlocking)
+}
+
+func (p *pool) submitWithPriority(task any, priority Priority, nonBlocking bool) (err error) {
 
 	p.submittedTaskCount.Add(1)
 
 	if nonBlocking {
-		err = p.trySubmit(task)
+		err = p.trySubmit(task, priority)
 	} else {
-		err = p.blockingTrySubmit(task)
+		err = p.blockingTrySubmit(task, priority)
 	}
 
 	if err != nil {
@@ -394,9 +433,9 @@ func (p *pool) submit(task any, nonBlocking bool) (err error) {
 	return
 }
 
-func (p *pool) blockingTrySubmit(task any) error {
+func (p *pool) blockingTrySubmit(task any, priority Priority) error {
 	for {
-		if err := p.trySubmit(task); err != ErrQueueFull {
+		if err := p.trySubmit(task, priority); err != ErrQueueFull {
 			return err
 		}
 
@@ -414,7 +453,7 @@ func (p *pool) blockingTrySubmit(task any) error {
 	}
 }
 
-func (p *pool) trySubmit(task any) error {
+func (p *pool) trySubmit(task any, priority Priority) error {
 	p.mutex.Lock()
 
 	// Check if the pool has been stopped while holding the lock
@@ -425,7 +464,7 @@ func (p *pool) trySubmit(task any) error {
 	}
 
 	queueEnabled := p.queueSize > 0
-	tasksLen := int(p.tasks.Len())
+	tasksLen := p.queue.Len()
 
 	// When queue is enabled, check if it is full
 	if queueEnabled && tasksLen >= p.queueSize {
@@ -441,7 +480,7 @@ func (p *pool) trySubmit(task any) error {
 		}
 
 		// If queue is enabled, push the task at the back of the queue
-		p.tasks.Write(task)
+		p.queue.Push(task, priority)
 		p.mutex.Unlock()
 		return nil
 	}
@@ -451,10 +490,10 @@ func (p *pool) trySubmit(task any) error {
 
 	if queueEnabled && tasksLen > 0 {
 		// Push the task at the back of the queue
-		p.tasks.Write(task)
+		p.queue.Push(task, priority)
 
 		// Pop the front task
-		task, _ = p.tasks.Read()
+		task, _ = p.queue.Pop()
 	}
 
 	p.mutex.Unlock()
@@ -481,7 +520,7 @@ func (p *pool) launchWorker(task any) {
 func (p *pool) readTask() (task any, err error) {
 	p.mutex.Lock()
 
-	if p.tasks.Len() == 0 {
+	if p.queue.Len() == 0 {
 		// No more tasks in the queue, worker will exit
 		p.workerCount.Add(-1)
 		p.workerWaitGroup.Done()
@@ -504,7 +543,7 @@ func (p *pool) readTask() (task any, err error) {
 		return
 	}
 
-	task, _ = p.tasks.Read()
+	task, _ = p.queue.Pop()
 
 	p.mutex.Unlock()
 
@@ -612,7 +651,7 @@ func newPool(maxConcurrency int, parent *pool, options ...Option) *pool {
 
 	pool.ctx, pool.cancel = context.WithCancelCause(pool.ctx)
 
-	pool.tasks = linkedbuffer.NewLinkedBuffer[any](LinkedBufferInitialSize, LinkedBufferMaxCapacity)
+	pool.queue = newPriorityQueue(defaultPriorityOvertakeLimit)
 
 	return pool
 }

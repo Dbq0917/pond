@@ -13,26 +13,40 @@ type ResultPool[R any] interface {
 	// Submits a task to the pool and returns a future that can be used to wait for the task to complete and get the result.
 	// The pool will not accept new tasks after it has been stopped.
 	// If the pool has been stopped, this method will return ErrPoolStopped.
-	Submit(task func() R) ResultTask[R]
+	Submit(task func() R, options ...TaskOption) ResultTask[R]
 
 	// Submits a task to the pool and returns a future that can be used to wait for the task to complete and get the result.
 	// The task function must return a result and an error.
 	// The pool will not accept new tasks after it has been stopped.
 	// If the pool has been stopped, this method will return ErrPoolStopped.
-	SubmitErr(task func() (R, error)) ResultTask[R]
+	SubmitErr(task func() (R, error), options ...TaskOption) ResultTask[R]
 
 	// Attempts to submit a task to the pool and returns a future that can be used to wait for the task to complete
 	// and a boolean indicating whether the task was submitted successfully.
 	// The pool will not accept new tasks after it has been stopped.
 	// If the pool has been stopped, this method will return ErrPoolStopped.
-	TrySubmit(task func() R) (ResultTask[R], bool)
+	TrySubmit(task func() R, options ...TaskOption) (ResultTask[R], bool)
 
 	// Attempts to submit a task to the pool and returns a future that can be used to wait for the task to complete
 	// and a boolean indicating whether the task was submitted successfully.
 	// The task function must return a result and an error.
 	// The pool will not accept new tasks after it has been stopped.
 	// If the pool has been stopped, this method will return ErrPoolStopped.
-	TrySubmitErr(task func() (R, error)) (ResultTask[R], bool)
+	TrySubmitErr(task func() (R, error), options ...TaskOption) (ResultTask[R], bool)
+
+	// SubmitWithPriority submits a task at the given priority and returns a future.
+	// Higher priority tasks jump ahead of lower priority queued tasks.
+	SubmitWithPriority(priority Priority, task func() R) ResultTask[R]
+
+	// SubmitErrWithPriority submits an error-returning task at the given priority.
+	SubmitErrWithPriority(priority Priority, task func() (R, error)) ResultTask[R]
+
+	// TrySubmitWithPriority attempts a non-blocking submission at the given priority.
+	TrySubmitWithPriority(priority Priority, task func() R) (ResultTask[R], bool)
+
+	// TrySubmitErrWithPriority is the error-returning variant of
+	// TrySubmitWithPriority.
+	TrySubmitErrWithPriority(priority Priority, task func() (R, error)) (ResultTask[R], bool)
 
 	// Creates a new subpool with the specified maximum concurrency and options.
 	NewSubpool(maxConcurrency int, options ...Option) ResultPool[R]
@@ -56,25 +70,45 @@ func (p *resultPool[R]) NewGroupContext(ctx context.Context) ResultTaskGroup[R] 
 	return newResultTaskGroup[R](p.pool, ctx)
 }
 
-func (p *resultPool[R]) Submit(task func() R) ResultTask[R] {
-	future, _ := p.submit(task, p.nonBlocking)
+func (p *resultPool[R]) Submit(task func() R, options ...TaskOption) ResultTask[R] {
+	config := resolveTaskConfig(options)
+	future, _ := p.submitWithPriority(task, config.priority, p.nonBlocking)
 	return future
 }
 
-func (p *resultPool[R]) SubmitErr(task func() (R, error)) ResultTask[R] {
-	future, _ := p.submit(task, p.nonBlocking)
+func (p *resultPool[R]) SubmitErr(task func() (R, error), options ...TaskOption) ResultTask[R] {
+	config := resolveTaskConfig(options)
+	future, _ := p.submitWithPriority(task, config.priority, p.nonBlocking)
 	return future
 }
 
-func (p *resultPool[R]) TrySubmit(task func() R) (ResultTask[R], bool) {
-	return p.submit(task, true)
+func (p *resultPool[R]) TrySubmit(task func() R, options ...TaskOption) (ResultTask[R], bool) {
+	config := resolveTaskConfig(options)
+	return p.submitWithPriority(task, config.priority, true)
 }
 
-func (p *resultPool[R]) TrySubmitErr(task func() (R, error)) (ResultTask[R], bool) {
-	return p.submit(task, true)
+func (p *resultPool[R]) TrySubmitErr(task func() (R, error), options ...TaskOption) (ResultTask[R], bool) {
+	config := resolveTaskConfig(options)
+	return p.submitWithPriority(task, config.priority, true)
 }
 
-func (p *resultPool[R]) submit(task any, nonBlocking bool) (ResultTask[R], bool) {
+func (p *resultPool[R]) SubmitWithPriority(priority Priority, task func() R) ResultTask[R] {
+	return p.Submit(task, WithPriority(priority))
+}
+
+func (p *resultPool[R]) SubmitErrWithPriority(priority Priority, task func() (R, error)) ResultTask[R] {
+	return p.SubmitErr(task, WithPriority(priority))
+}
+
+func (p *resultPool[R]) TrySubmitWithPriority(priority Priority, task func() R) (ResultTask[R], bool) {
+	return p.TrySubmit(task, WithPriority(priority))
+}
+
+func (p *resultPool[R]) TrySubmitErrWithPriority(priority Priority, task func() (R, error)) (ResultTask[R], bool) {
+	return p.TrySubmitErr(task, WithPriority(priority))
+}
+
+func (p *resultPool[R]) submitWithPriority(task any, priority Priority, nonBlocking bool) (ResultTask[R], bool) {
 	ctx := p.Context()
 	future, resolve := future.NewValueFuture[R](ctx)
 
@@ -86,7 +120,7 @@ func (p *resultPool[R]) submit(task any, nonBlocking bool) (ResultTask[R], bool)
 
 	wrapped := wrapTask[R, func(R, error)](task, resolve, ctx, p.pool.panicRecovery)
 
-	if err := p.pool.submit(wrapped, nonBlocking); err != nil {
+	if err := p.pool.submitWithPriority(wrapped, priority, nonBlocking); err != nil {
 		var zero R
 		resolve(zero, err)
 		return future, false
